@@ -1,5 +1,6 @@
 //! The main entrypoint for running computations.
 
+use std::iter::zip;
 use std::thread;
 use std::time::Instant;
 use color_eyre::{eyre::Ok, Result};
@@ -104,17 +105,24 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
     (idxs, elevations)
 }
 
+const EARTH_RADIUS_SQUARED: f32 = 12_742_000.0;
+const TAN_ONE_RAD: f32 = 0.017_453_3;
 
 fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize) -> Vec<f32> {
     assert_eq!(elevations.len(), 2 * max_los * max_los);
-    assert_eq!(max_los % 4, 0);
+    assert_eq!(max_los % 8, 0);
 
     let height = max_los;
     let width = 2 * max_los;
 
     let mut result = vec![0.0; max_los * max_los];
 
-    for line_idx in 0..height {
+    let distances = (1..max_los)
+        .into_iter()
+        .map(|x| (x * 100) as f32)
+        .collect::<Vec<f32>>();
+
+    for line_idx in 0..max_los {
         let elevation_offset = line_idx * width;
 
         let line = &elevations[elevation_offset..(elevation_offset + width)];
@@ -123,22 +131,31 @@ fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize) -> Vec<f32> {
         let line_indexes = &indexes[indexes_offset..(indexes_offset + max_los)];
 
         for pov in 0..max_los {
-            let mut sum = 0.0;
-            let mut max_angle = -2000.0;
+            let mut max_angle: f32 = -2000.0;
             let pov_height = unsafe { *line.get_unchecked(pov) } as f32;
 
-            for point in pov..(pov+max_los) {
+            let elevations = line[pov+1..pov+max_los]
+                .into_iter()
+                .map(|&x| x as f32 - pov_height);
 
-                let elevation_delta = (unsafe { *line.get_unchecked(point) } as f32) - pov_height;
-                let distance = ((point-pov) * 100) as f32;
+            let angles = zip(&distances, elevations)
+                .map(|(&distance, elevation): (&f32, f32)| {
+                    (elevation / distance) - (distance / EARTH_RADIUS_SQUARED)
+                })
+                .collect::<Vec<f32>>();
 
-                // TODO: don't do flat earth
-                let angle = (elevation_delta / distance);
-                if angle >= max_angle {
-                    max_angle = angle;
-                    sum += distance
-                }
-            }
+            let mut sum: f32 = 0.0;
+            let surface_bitmap = zip(&distances, &angles)
+                .map(|(&distance, &angle)| {
+                    if angle >= max_angle {
+                        sum += distance * TAN_ONE_RAD;
+                        max_angle = angle;
+                        true
+                    } else {
+                        false
+                    }
+                })
+                .collect::<Vec<bool>>();
 
             let result_idx = line_indexes[pov];
             if result_idx > 0 {
@@ -160,9 +177,6 @@ fn multithread_rotations(
     count: usize,
     offset: usize,
 ) -> () {
-    // let mut flat_indexes = vec![];
-    // let mut flat_elevations = vec![];
-
     thread::scope(|s| {
         let threads = (offset..offset + count)
             .map(|angle| {
@@ -347,7 +361,14 @@ impl<'compute> Compute<'compute> {
         };
 
         if matches!(self.backend, crate::config::Backend::CPU) {
-            let elevations = self.dem.elevations.iter().map(|&x| x as i16).collect::<Vec<i16>>();
+            let elevations = self.dem.elevations.iter()
+                .map(|&x| x as i16)
+                .collect::<Vec<i16>>();
+            const NUM_CORES: usize = 8;
+            for offset in (0..360).step_by(NUM_CORES) {
+                multithread_rotations(&elevations, 6000, NUM_CORES, offset);
+            }
+
             multithread_rotations(&elevations, 6000, 8, 0);
             return Ok(());
         }
