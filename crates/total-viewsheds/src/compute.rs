@@ -1,9 +1,9 @@
 //! The main entrypoint for running computations.
 
+use color_eyre::{eyre::Ok, Result};
 use std::iter::zip;
 use std::thread;
 use std::time::Instant;
-use color_eyre::{eyre::Ok, Result};
 
 /// Handles all the computations.
 pub struct Compute<'compute> {
@@ -45,7 +45,7 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
     let (sin, cos) = (f64::sin(angle.to_radians()), f64::cos(angle.to_radians()));
     let (x_center, y_center) = (width / 2, width / 2);
 
-    let mut rotation = Vec::with_capacity(width as usize * 2*max_los);
+    let mut rotation = Vec::with_capacity(width as usize * 2 * max_los);
 
     for x in (max_los as isize)..(max_los as isize) * 2 {
         let x_sin = (x - x_center) as f64 * sin;
@@ -68,7 +68,10 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
         }
     }
 
-    assert_eq!(rotation.len() as isize, max_los as isize * (width-max_los as isize));
+    assert_eq!(
+        rotation.len() as isize,
+        max_los as isize * (width - max_los as isize)
+    );
 
     // map the indexes to their elevations
     let elevations = rotation
@@ -85,22 +88,21 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
     let idxs = (0..max_los)
         .into_iter()
         .map(|idx| {
-            let start = idx*(2*max_los);
+            let start = idx * (2 * max_los);
             let end = start + max_los;
             &rotation[start..end]
         })
         .flatten()
         .map(|&val| {
-            let x = (val / 18000) - 6000;
-            let y = (val % 18000) - 6000;
-            if (0..6000).contains(&x) && (0..6000).contains(&y) {
-                x * 6000 + y
+            let x = (val / width as i32) - max_los as i32;
+            let y = (val % width as i32) - max_los as i32;
+            if (0..max_los as i32).contains(&x) && (0..max_los as i32).contains(&y) {
+                x * (max_los as i32) + y
             } else {
                 -1i32
             }
         })
         .collect();
-
 
     (idxs, elevations)
 }
@@ -108,15 +110,18 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
 const EARTH_RADIUS_SQUARED: f32 = 12_742_000.0;
 const TAN_ONE_RAD: f32 = 0.017_453_3;
 
-fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize) -> Vec<f32> {
+fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize, result: &mut [f32]) {
+    // elevations from the rotation kernel
     assert_eq!(elevations.len(), 2 * max_los * max_los);
+
+    // TODO: assertions like these make quite a bit of sense because it helps the vectorizer
+    //       figure out what is reasonable
     assert_eq!(max_los % 8, 0);
 
     let width = 2 * max_los;
 
-    let mut result = vec![0.0; max_los * max_los];
-
-    // precalculate all distances and their
+    // precalculate all distances and their spherical earth "adjustments".
+    // This saves ~33% of effort inside our hot loop
     let distances = (1..max_los)
         .into_iter()
         .map(|x| {
@@ -132,11 +137,20 @@ fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize) -> Vec<f32> {
         let indexes_offset = line_idx * max_los;
         let line_indexes = &indexes[indexes_offset..(indexes_offset + max_los)];
 
+        // The hottest of the hot loops.
+        // Any change inside this loop needs careful benchmarking before committing
         for pov in 0..max_los {
-            let mut max_angle: f32 = -2000.0;
+            // if the line of sight is not within our computable points, do not consider it
+            let result_idx = line_indexes[pov];
+            if result_idx < 0 {
+                continue;
+            }
+
             let pov_height = unsafe { *line.get_unchecked(pov) } as f32;
 
-            let elevations = line[pov+1..pov+max_los]
+            // convert the max_los-1 elevations ahead of the POV into floats, and adjust
+            // for the observer's height
+            let elevations = line[pov + 1..pov + max_los]
                 .into_iter()
                 .map(|&x| x as f32 - pov_height);
 
@@ -144,62 +158,70 @@ fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize) -> Vec<f32> {
             // Collect all angle calculations into a vec, turning all the lazy computations
             // into an eager one. It looks inefficient, as it is thrashing memory
             // (allocating/deallocating the vec) in each loop iteration, but the rest of the program
-            // has a dependency on previous iterations blocking up the pipeline.
+            // depends on previous iterations which will block up the pipeline and reduce FLOPS.
             //
-            // So long as a
+            // So long as the allocator is able to handle this allocation pattern it is faster.
             //
             // If you would like to optimize computation as a single unit, remove the .collect,
-            // and the surface_bitmap zip iterator will contain all the code for a single loop.
+            // and the surface_bitmap's zip iterator will contain all the code for a single loop.
+            // Good luck!
             let angles = zip(&distances, elevations)
                 .map(|((distance, adjustment), elevation)| -> f32 {
-                    (elevation / distance)
+                    (elevation / distance) - adjustment
                 })
                 .collect::<Vec<f32>>();
 
             let mut sum: f32 = 0.0;
+            let mut max_angle: f32 = -2000.0;
+
+            // add up the visible surfaces for the heatmap
             let surface_bitmap = zip(&distances, &angles)
                 .map(|(&(distance, _), &angle)| {
+                    // a particular point is visible if all previous points before it
+                    // are at a lower angle
                     let higher = angle >= max_angle;
                     if higher {
                         sum += distance * TAN_ONE_RAD;
                         max_angle = angle;
                     }
+                    // keep track of whether a point is visible for further storage
                     higher
                 })
                 .collect::<Vec<bool>>();
 
-            let result_idx = line_indexes[pov];
-            if result_idx > 0 {
-                unsafe { *result.get_unchecked_mut(result_idx as usize) = sum };
-            }
+            // safety: it is guaranteed by the rotation kernel that if the index is
+            // greater than zero that it is in-bounds. This saves ~10% of bounds checks
+            unsafe { *result.get_unchecked_mut(result_idx as usize) += sum };
         }
     }
-
-    result
 }
 
 fn multithread_rotations(
     elevations: &[i16],
     max_los_points: usize,
-    count: usize,
-    chunk_count: usize,
+    num_angles: usize,
+    core_count: usize,
 ) -> Vec<f32> {
-
     thread::scope(|s| {
-        let threads = (0..chunk_count)
+        let threads = (0..core_count)
             .map(|start_angle: usize| {
                 s.spawn(move || {
                     let start_angle = start_angle;
                     let mut res = vec![0.0f32; max_los_points * max_los_points];
-                    println!("{start_angle}..{count}.step_by({chunk_count})");
-                    for angle in (start_angle..count).step_by(chunk_count) {
+                    println!("{start_angle}..{num_angles}.step_by({core_count})");
+                    for angle in (start_angle..num_angles).step_by(core_count) {
                         let mut start = Instant::now();
-                        let (indexes, elevations) = generate_rotation(elevations, angle as f64, max_los_points);
-                        println!("rotated {:?} in {:?}, calculating kernel", angle, start.elapsed());
+                        let (indexes, elevations) =
+                            generate_rotation(elevations, angle as f64, max_los_points);
+                        println!(
+                            "rotated {:?} in {:?}, calculating kernel",
+                            angle,
+                            start.elapsed()
+                        );
 
                         start = Instant::now();
-                        let processed = cpu_kernel(&elevations, &indexes, max_los_points);
-                        res = zip(res, processed).map(|(l, r)| l + r).collect();
+
+                        cpu_kernel(&elevations, &indexes, max_los_points, res.as_mut_slice());
                         println!("kernel for {} run in: {:?}", angle, start.elapsed());
                     }
                     res
@@ -378,7 +400,10 @@ impl<'compute> Compute<'compute> {
         };
 
         if matches!(self.backend, crate::config::Backend::CPU) {
-            let elevations = self.dem.elevations.iter()
+            let elevations = self
+                .dem
+                .elevations
+                .iter()
                 .map(|&x| x as i16)
                 .collect::<Vec<i16>>();
 
@@ -648,7 +673,7 @@ pub mod test {
             1.0,
             3,
         )
-            .unwrap()
+        .unwrap()
     }
 
     pub fn compute<'dem>(dem: &'dem mut crate::dem::DEM, elevations: &[i16]) -> Compute<'dem> {
@@ -665,7 +690,7 @@ pub mod test {
             5000.0,
             1.8,
         )
-            .unwrap();
+        .unwrap();
         compute.run().unwrap();
         compute
     }
@@ -680,7 +705,7 @@ pub mod test {
             &ring_data,
             crate::compute::Compute::ring_count_per_band(5000.0, 3),
         )
-            .unwrap()
+        .unwrap()
     }
 
     #[rustfmt::skip]
