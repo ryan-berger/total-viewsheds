@@ -112,19 +112,21 @@ fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize) -> Vec<f32> {
     assert_eq!(elevations.len(), 2 * max_los * max_los);
     assert_eq!(max_los % 8, 0);
 
-    let height = max_los;
     let width = 2 * max_los;
 
     let mut result = vec![0.0; max_los * max_los];
 
+    // precalculate all distances and their
     let distances = (1..max_los)
         .into_iter()
-        .map(|x| (x * 100) as f32)
-        .collect::<Vec<f32>>();
+        .map(|x| {
+            let distance = (x * 100) as f32;
+            (distance, distance / EARTH_RADIUS_SQUARED)
+        })
+        .collect::<Vec<(f32, f32)>>();
 
     for line_idx in 0..max_los {
         let elevation_offset = line_idx * width;
-
         let line = &elevations[elevation_offset..(elevation_offset + width)];
 
         let indexes_offset = line_idx * max_los;
@@ -138,28 +140,37 @@ fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize) -> Vec<f32> {
                 .into_iter()
                 .map(|&x| x as f32 - pov_height);
 
+            // Here be dragons:
+            // Collect all angle calculations into a vec, turning all the lazy computations
+            // into an eager one. It looks inefficient, as it is thrashing memory
+            // (allocating/deallocating the vec) in each loop iteration, but the rest of the program
+            // has a dependency on previous iterations blocking up the pipeline.
+            //
+            // So long as a
+            //
+            // If you would like to optimize computation as a single unit, remove the .collect,
+            // and the surface_bitmap zip iterator will contain all the code for a single loop.
             let angles = zip(&distances, elevations)
-                .map(|(&distance, elevation): (&f32, f32)| {
-                    (elevation / distance) - (distance / EARTH_RADIUS_SQUARED)
+                .map(|((distance, adjustment), elevation)| -> f32 {
+                    (elevation / distance)
                 })
                 .collect::<Vec<f32>>();
 
             let mut sum: f32 = 0.0;
             let surface_bitmap = zip(&distances, &angles)
-                .map(|(&distance, &angle)| {
-                    if angle >= max_angle {
+                .map(|(&(distance, _), &angle)| {
+                    let higher = angle >= max_angle;
+                    if higher {
                         sum += distance * TAN_ONE_RAD;
                         max_angle = angle;
-                        true
-                    } else {
-                        false
                     }
+                    higher
                 })
                 .collect::<Vec<bool>>();
 
             let result_idx = line_indexes[pov];
             if result_idx > 0 {
-                result[result_idx as usize] = sum;
+                unsafe { *result.get_unchecked_mut(result_idx as usize) = sum };
             }
         }
     }
@@ -167,38 +178,43 @@ fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize) -> Vec<f32> {
     result
 }
 
-// TODO: this currently eats over half my RAM on my big machine.
-//       Good news is that this takes a total of 20s for all 180 angles, giving us
-//       An overhead of .1s/angle. Funnily enough, this does very well multithreaded,
-//       Single threaded it seems to take quite a bit longer??
 fn multithread_rotations(
     elevations: &[i16],
     max_los_points: usize,
     count: usize,
-    offset: usize,
-) -> () {
-    thread::scope(|s| {
-        let threads = (offset..offset + count)
-            .map(|angle| {
-                s.spawn(move || {
-                    let mut start = Instant::now();
-                    let (indexes, elevations) = generate_rotation(elevations, angle as f64, max_los_points);
-                    println!("rotated {:?} in {:?}, calculating kernel", angle, start.elapsed());
+    chunk_count: usize,
+) -> Vec<f32> {
 
-                    start = Instant::now();
-                    let res = cpu_kernel(&elevations, &indexes, max_los_points);
-                    println!("kernel for {} run in: {:?}", angle, start.elapsed());
+    thread::scope(|s| {
+        let threads = (0..chunk_count)
+            .map(|start_angle: usize| {
+                s.spawn(move || {
+                    let start_angle = start_angle;
+                    let mut res = vec![0.0f32; max_los_points * max_los_points];
+                    println!("{start_angle}..{count}.step_by({chunk_count})");
+                    for angle in (start_angle..count).step_by(chunk_count) {
+                        let mut start = Instant::now();
+                        let (indexes, elevations) = generate_rotation(elevations, angle as f64, max_los_points);
+                        println!("rotated {:?} in {:?}, calculating kernel", angle, start.elapsed());
+
+                        start = Instant::now();
+                        let processed = cpu_kernel(&elevations, &indexes, max_los_points);
+                        res = zip(res, processed).map(|(l, r)| l + r).collect();
+                        println!("kernel for {} run in: {:?}", angle, start.elapsed());
+                    }
                     res
                 })
             })
             .collect::<Vec<_>>();
 
+        let mut res = vec![0.0f32; max_los_points * max_los_points];
         for thread in threads {
-            println!("{:?}", thread.join().unwrap()[10]);
+            res = zip(res, thread.join().unwrap())
+                .map(|(l, r)| l + r)
+                .collect();
         }
+        res
     })
-
-    // (flat_indexes, flat_elevations)
 }
 
 impl<'compute> Compute<'compute> {
@@ -341,6 +357,7 @@ impl<'compute> Compute<'compute> {
     /// Do all computations.
     pub fn run(&mut self) -> Result<()> {
         let mut sector_surfaces = if Self::is_process_surfaces(&self.process) {
+            println!("{}", self.dem.computable_points_count);
             let blank = vec![0.0; usize::try_from(self.dem.computable_points_count)?];
             self.total_surfaces.clone_from(&blank);
             blank
@@ -364,12 +381,11 @@ impl<'compute> Compute<'compute> {
             let elevations = self.dem.elevations.iter()
                 .map(|&x| x as i16)
                 .collect::<Vec<i16>>();
-            const NUM_CORES: usize = 8;
-            for offset in (0..360).step_by(NUM_CORES) {
-                multithread_rotations(&elevations, 6000, NUM_CORES, offset);
-            }
 
-            multithread_rotations(&elevations, 6000, 8, 0);
+            const NUM_CORES: usize = 8;
+            let surfaces = multithread_rotations(&elevations, 6000, 360, NUM_CORES);
+            self.add_sector_surfaces_to_running_total(&surfaces);
+            self.render_total_surfaces()?;
             return Ok(());
         }
 
