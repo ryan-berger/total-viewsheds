@@ -1,6 +1,7 @@
 //! The main entrypoint for running computations.
 
 use color_eyre::{eyre::Ok, Result};
+use itertools::izip;
 use std::iter::zip;
 use std::thread;
 use std::time::Instant;
@@ -36,41 +37,56 @@ pub struct Compute<'compute> {
 /// `generate_rotation` generates a rotation "map" for a given elevation list
 /// Adapted from [this stack overflow answer](https://stackoverflow.com/a/71901621)
 fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Vec<i16>) {
-    let width = (max_los * 3) as isize;
+    let width = max_los * 3;
 
-    assert_eq!(width % 2, 0);
-    assert_eq!(elevs.len() as isize % width, 0);
-    assert_eq!(elevs.len() as isize / width, width);
+    assert_eq!(elevs.len() % width, 0, "elevs should be squared");
+    assert_eq!(
+        elevs.len() / width,
+        width,
+        "elevs should be square"
+    );
+    assert!(
+        elevs.len() < (1usize << 31_i32),
+        "must have less than 2^31 elevations as we use i32s"
+    );
 
     let (sin, cos) = (f64::sin(angle.to_radians()), f64::cos(angle.to_radians()));
     let (x_center, y_center) = (width / 2, width / 2);
 
-    let mut rotation = Vec::with_capacity(width as usize * 2 * max_los);
+    let mut rotation = Vec::with_capacity(2 *max_los * max_los);
 
-    for x in (max_los as isize)..(max_los as isize) * 2 {
+    for x in max_los..max_los * 2 {
         let x_sin = (x - x_center) as f64 * sin;
         let x_cos = (x - x_center) as f64 * cos;
-        for y in (max_los as isize)..width {
+
+        for y in max_los..width {
             let y_sin = (y - y_center) as f64 * sin;
             let y_cos = (y - y_center) as f64 * cos;
 
-            let x_rot = (x_cos - y_sin).round() as isize + y_center;
-            let y_rot = (y_cos + x_sin).round() as isize + x_center;
+            let x_rot = (x_cos - y_sin).round() as isize + y_center as isize;
+            let y_rot = (y_cos + x_sin).round() as isize + x_center as isize;
 
-            let new_idx = x_rot.clamp(0, width - 1) * width + y_rot.clamp(0, width - 1);
-            let normalized = if new_idx >= 0 && new_idx < elevs.len() as isize {
-                new_idx
+            let new_idx = x_rot.clamp(0, (width - 1) as isize) * (width as isize)+ y_rot.clamp(0, (width - 1) as isize);
+            let normalized = if (new_idx as usize) < elevs.len() {
+                new_idx as usize
             } else {
-                panic!("bad idx: {new_idx}")
+                // the clamping implies this is the case, but the extra check is done for development
+                unreachable!()
             };
 
+            #[expect(
+                clippy::as_conversions,
+                clippy::cast_possible_truncation,
+                reason = "normalized should be in [0, 2^31)"
+            )]
             rotation.push(normalized as i32);
         }
     }
 
     assert_eq!(
-        rotation.len() as isize,
-        max_los as isize * (width - max_los as isize)
+        rotation.len(),
+        max_los * (width - max_los),
+        "rotation should be 2*width wide, max_los tall"
     );
 
     // map the indexes to their elevations
@@ -80,23 +96,32 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
             if idx < 0i32 {
                 i16::MIN
             } else {
+                // safety: values are clamped in the above code and are guaranteed to be in bounds
                 *unsafe { elevs.get_unchecked(idx as usize) }
             }
         })
         .collect::<Vec<i16>>();
 
     let idxs = (0..max_los)
-        .into_iter()
-        .map(|idx| {
+        .flat_map(|idx| {
             let start = idx * (2 * max_los);
             let end = start + max_los;
+
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "[start, end) is always in bounds of rotation because (start-end) < 2 * max_los, start < rotation.len() - (2*max_los)",
+            )]
             &rotation[start..end]
         })
-        .flatten()
         .map(|&val| {
+            #[expect(clippy::as_conversions, clippy::cast_possible_wrap, clippy::cast_possible_truncation, reason="We only support 32 bit platforms")]
             let x = (val / width as i32) - max_los as i32;
+            #[expect(clippy::as_conversions, clippy::cast_possible_wrap, clippy::cast_possible_truncation, reason="We only support 32 bit platforms")]
             let y = (val % width as i32) - max_los as i32;
-            if (0..max_los as i32).contains(&x) && (0..max_los as i32).contains(&y) {
+
+            #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason="(max_los^2) < (2 << 31)")]
+            #[expect(clippy::cast_possible_wrap, reason="We only support 32 bit platforms")]
+            if (0i32..max_los as i32).contains(&x) && (0i32..max_los as i32).contains(&y) {
                 x * (max_los as i32) + y
             } else {
                 -1i32
@@ -107,69 +132,104 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
     (idxs, elevations)
 }
 
+/// `EARTH_RADIUS_SQUARED` is the earth's radius squared in meters
 const EARTH_RADIUS_SQUARED: f32 = 12_742_000.0;
+
+/// `TAN_ONE_RAD` helps normalize the fact that inner points are sampled more often
+/// see the TVS paper for reasoning.
 const TAN_ONE_RAD: f32 = 0.017_453_3;
 
-fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize, result: &mut [f32]) {
-    // elevations from the rotation kernel
-    assert_eq!(elevations.len(), 2 * max_los * max_los);
+/// `total_viewshed` calculates a straight-lined total viewshed, which makes it ripe for
+/// instruction level parallelism (ILP) and vectorization (via SIMD)
+fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result: &mut [f32]) {
+    assert_eq!(
+        elevation_map.len(),
+        2 * max_los * max_los,
+        "elevations should be 2 * max_los wide, and max_los tall"
+    );
 
     // TODO: assertions like these make quite a bit of sense because it helps the vectorizer
     //       figure out what is reasonable
-    assert_eq!(max_los % 8, 0);
+    assert_eq!(
+        max_los % 8,
+        0,
+        "to help the vectorizer, max_los must be a multiple of 8"
+    );
 
     let width = 2 * max_los;
 
     // precalculate all distances and their spherical earth "adjustments".
     // This saves ~33% of effort inside our hot loop
     let distances = (1..max_los)
-        .into_iter()
         .map(|x| {
+            #[expect(
+                clippy::as_conversions,
+                clippy::cast_precision_loss,
+                reason = "x is in [1..max_los), max_los < 2^23"
+            )]
             let distance = (x * 100) as f32;
             (distance, distance / EARTH_RADIUS_SQUARED)
         })
         .collect::<Vec<(f32, f32)>>();
 
+    let mut angles = vec![0.0f32; max_los - 1];
+
     for line_idx in 0..max_los {
         let elevation_offset = line_idx * width;
-        let line = &elevations[elevation_offset..(elevation_offset + width)];
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "elevation_offset < (elevation_map.len()-max_los) so slicing is always in bounds"
+        )]
+        let line = &elevation_map[elevation_offset..(elevation_offset + width)];
 
         let indexes_offset = line_idx * max_los;
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "index_offset < (indexes.len()-max_los) so slicing is always in bounds"
+        )]
         let line_indexes = &indexes[indexes_offset..(indexes_offset + max_los)];
 
         // The hottest of the hot loops.
         // Any change inside this loop needs careful benchmarking before committing
         for pov in 0..max_los {
-            // if the line of sight is not within our computable points, do not consider it
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "line_indexes is max_los long so pov is always in bounds"
+            )]
             let result_idx = line_indexes[pov];
-            if result_idx < 0 {
+
+            // if the line of sight is not within our computable points, do not consider it
+            if result_idx < 0i32 {
                 continue;
             }
 
-            let pov_height = unsafe { *line.get_unchecked(pov) } as f32;
+            // safety: pov is guaranteed to be in bounds since the slice is max_los in size
+            let pov_height = f32::from(unsafe { *line.get_unchecked(pov) });
 
             // convert the max_los-1 elevations ahead of the POV into floats, and adjust
             // for the observer's height
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "[pov+1, pov+max_los) is always in bounds"
+            )]
             let elevations = line[pov + 1..pov + max_los]
                 .into_iter()
-                .map(|&x| x as f32 - pov_height);
+                .map(|&x| f32::from(x) - pov_height);
 
             // Here be dragons:
             // Collect all angle calculations into a vec, turning all the lazy computations
-            // into an eager one. It looks inefficient, as it is thrashing memory
-            // (allocating/deallocating the vec) in each loop iteration, but the rest of the program
-            // depends on previous iterations which will block up the pipeline and reduce FLOPS.
+            // into an eager one. It looks inefficient, as it using memory to store intermediate results
+            // but the rest of the program depends on previous iterations which will block up the
+            // instruction pipeline and reduce FLOPS without the memory use.
             //
-            // So long as the allocator is able to handle this allocation pattern it is faster.
-            //
-            // If you would like to optimize computation as a single unit, remove the .collect,
-            // and the surface_bitmap's zip iterator will contain all the code for a single loop.
+            // If you would like to optimize computation as a single unit, change the for_each to a
+            // map, and the surface_bitmap's zip iterator will contain all the code for a single loop.
             // Good luck!
-            let angles = zip(&distances, elevations)
-                .map(|((distance, adjustment), elevation)| -> f32 {
-                    (elevation / distance) - adjustment
-                })
-                .collect::<Vec<f32>>();
+            izip!(angles.iter_mut(), &distances, elevations).for_each(
+                |(angle, (distance, adjustment), elevation)| {
+                    *angle = (elevation / distance) - adjustment;
+                },
+            );
 
             let mut sum: f32 = 0.0;
             let mut max_angle: f32 = -2000.0;
@@ -191,38 +251,58 @@ fn cpu_kernel(elevations: &[i16], indexes: &[i32], max_los: usize, result: &mut 
 
             // safety: it is guaranteed by the rotation kernel that if the index is
             // greater than zero that it is in-bounds. This saves ~10% of bounds checks
-            unsafe { *result.get_unchecked_mut(result_idx as usize) += sum };
+            #[expect(
+                clippy::as_conversions,
+                clippy::cast_sign_loss,
+                reason = "result_idx should be in [0, 2^31]"
+            )]
+            unsafe {
+                *result.get_unchecked_mut(result_idx as usize) += sum;
+            }
         }
     }
 }
 
-fn multithread_rotations(
+/// `kernel` is a CPU-based total viewshed kernel. It makes use of image rotation to
+/// optimize the cache locality of all lookups for a total viewshed calculation
+fn kernel(elevations: &[i16], max_los_points: usize, angle: usize, res: &mut [f32]) {
+    assert!(angle < 360, "angle must be [0, 360)");
+    let mut start = Instant::now();
+
+    #[expect(
+        clippy::as_conversions,
+        clippy::cast_precision_loss,
+        reason = "angle is [0,360), not more than 2^54"
+    )]
+    let (indexes, rotated_elevations) = generate_rotation(elevations, angle as f64, max_los_points);
+
+    tracing::info!(
+        "rotated {:?} in {:?}, calculating kernel",
+        angle,
+        start.elapsed()
+    );
+
+    start = Instant::now();
+
+    total_viewshed(&rotated_elevations, &indexes, max_los_points, res);
+    tracing::info!("kernel for {} run in: {:?}", angle, start.elapsed());
+}
+
+/// `multithreaded_kernel` parallelizes CPU kernel calculations for a `core_count` and calculates
+/// `num_angles` different angles
+fn multithreaded_kernel(
     elevations: &[i16],
     max_los_points: usize,
     num_angles: usize,
     core_count: usize,
 ) -> Vec<f32> {
-    thread::scope(|s| {
+    thread::scope(|scope| {
         let threads = (0..core_count)
             .map(|start_angle: usize| {
-                s.spawn(move || {
-                    let start_angle = start_angle;
+                scope.spawn(move || {
                     let mut res = vec![0.0f32; max_los_points * max_los_points];
-                    println!("{start_angle}..{num_angles}.step_by({core_count})");
                     for angle in (start_angle..num_angles).step_by(core_count) {
-                        let mut start = Instant::now();
-                        let (indexes, elevations) =
-                            generate_rotation(elevations, angle as f64, max_los_points);
-                        println!(
-                            "rotated {:?} in {:?}, calculating kernel",
-                            angle,
-                            start.elapsed()
-                        );
-
-                        start = Instant::now();
-
-                        cpu_kernel(&elevations, &indexes, max_los_points, res.as_mut_slice());
-                        println!("kernel for {} run in: {:?}", angle, start.elapsed());
+                        kernel(elevations, max_los_points, angle, &mut res);
                     }
                     res
                 })
@@ -230,14 +310,23 @@ fn multithread_rotations(
             .collect::<Vec<_>>();
 
         let mut res = vec![0.0f32; max_los_points * max_los_points];
+        #[expect(
+            clippy::unwrap_used,
+            reason = "if the thread doesn't join, the program should terminate"
+        )]
         for thread in threads {
             res = zip(res, thread.join().unwrap())
-                .map(|(l, r)| l + r)
+                .map(|(acc, heatmap)| acc + heatmap)
                 .collect();
         }
         res
     })
 }
+
+/// `NUM_CORES` is the physical number of cores on a machine. Currently hardcoded to 8
+/// as that is what an i9900k has, and is a common configuration.
+/// TODO find a good syscall for this
+const NUM_CORES: usize = 8;
 
 impl<'compute> Compute<'compute> {
     /// Instantiate.
@@ -379,7 +468,6 @@ impl<'compute> Compute<'compute> {
     /// Do all computations.
     pub fn run(&mut self) -> Result<()> {
         let mut sector_surfaces = if Self::is_process_surfaces(&self.process) {
-            println!("{}", self.dem.computable_points_count);
             let blank = vec![0.0; usize::try_from(self.dem.computable_points_count)?];
             self.total_surfaces.clone_from(&blank);
             blank
@@ -400,6 +488,11 @@ impl<'compute> Compute<'compute> {
         };
 
         if matches!(self.backend, crate::config::Backend::CPU) {
+            #[expect(
+                clippy::as_conversions,
+                clippy::cast_possible_truncation,
+                reason = "elevations start out as i16s, and i16 -> f32 -> i16 is lossless"
+            )]
             let elevations = self
                 .dem
                 .elevations
@@ -407,8 +500,14 @@ impl<'compute> Compute<'compute> {
                 .map(|&x| x as i16)
                 .collect::<Vec<i16>>();
 
-            const NUM_CORES: usize = 8;
-            let surfaces = multithread_rotations(&elevations, 6000, 360, NUM_CORES);
+            #[expect(clippy::as_conversions, reason = "max_los_as_points is ")]
+            let surfaces = multithreaded_kernel(
+                &elevations,
+                self.dem.max_los_as_points as usize,
+                90,
+                NUM_CORES,
+            );
+
             self.add_sector_surfaces_to_running_total(&surfaces);
             self.render_total_surfaces()?;
             return Ok(());
@@ -762,7 +861,7 @@ pub mod test {
             compute.total_surfaces,
             [
                 2687.689, 2546.9956, 2622.3494,
-                2564.7678, 3231.647, 2239.714, 
+                2564.7678, 3231.647, 2239.714,
                 2604.2551, 2186.5012, 1768.3433
             ]
         );
