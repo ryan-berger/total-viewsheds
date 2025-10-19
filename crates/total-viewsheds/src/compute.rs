@@ -37,56 +37,41 @@ pub struct Compute<'compute> {
 /// `generate_rotation` generates a rotation "map" for a given elevation list
 /// Adapted from [this stack overflow answer](https://stackoverflow.com/a/71901621)
 fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Vec<i16>) {
-    let width = max_los * 3;
+    let width = (max_los * 3) as isize;
 
-    assert_eq!(elevs.len() % width, 0, "elevs should be squared");
-    assert_eq!(
-        elevs.len() / width,
-        width,
-        "elevs should be square"
-    );
-    assert!(
-        elevs.len() < (1usize << 31_i32),
-        "must have less than 2^31 elevations as we use i32s"
-    );
+    assert_eq!(width % 2, 0);
+    assert_eq!(elevs.len() as isize % width, 0);
+    assert_eq!(elevs.len() as isize / width, width);
 
     let (sin, cos) = (f64::sin(angle.to_radians()), f64::cos(angle.to_radians()));
     let (x_center, y_center) = (width / 2, width / 2);
 
-    let mut rotation = Vec::with_capacity(2 *max_los * max_los);
+    let mut rotation = Vec::with_capacity(2 * max_los * max_los);
 
-    for x in max_los..max_los * 2 {
+    for x in (max_los as isize)..(max_los as isize) * 2 {
         let x_sin = (x - x_center) as f64 * sin;
         let x_cos = (x - x_center) as f64 * cos;
-
-        for y in max_los..width {
+        for y in (max_los as isize)..width {
             let y_sin = (y - y_center) as f64 * sin;
             let y_cos = (y - y_center) as f64 * cos;
 
-            let x_rot = (x_cos - y_sin).round() as isize + y_center as isize;
-            let y_rot = (y_cos + x_sin).round() as isize + x_center as isize;
+            let x_rot = (x_cos - y_sin).round() as isize + y_center;
+            let y_rot = (y_cos + x_sin).round() as isize + x_center;
 
-            let new_idx = x_rot.clamp(0, (width - 1) as isize) * (width as isize)+ y_rot.clamp(0, (width - 1) as isize);
-            let normalized = if (new_idx as usize) < elevs.len() {
-                new_idx as usize
+            let new_idx = x_rot.clamp(0, width - 1) * width + y_rot.clamp(0, width - 1);
+            let normalized = if new_idx >= 0 && new_idx < elevs.len() as isize {
+                new_idx
             } else {
-                // the clamping implies this is the case, but the extra check is done for development
-                unreachable!()
+                panic!("bad idx: {new_idx}")
             };
 
-            #[expect(
-                clippy::as_conversions,
-                clippy::cast_possible_truncation,
-                reason = "normalized should be in [0, 2^31)"
-            )]
             rotation.push(normalized as i32);
         }
     }
 
     assert_eq!(
-        rotation.len(),
-        max_los * (width - max_los),
-        "rotation should be 2*width wide, max_los tall"
+        rotation.len() as isize,
+        max_los as isize * (width - max_los as isize)
     );
 
     // map the indexes to their elevations
@@ -96,7 +81,6 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
             if idx < 0i32 {
                 i16::MIN
             } else {
-                // safety: values are clamped in the above code and are guaranteed to be in bounds
                 *unsafe { elevs.get_unchecked(idx as usize) }
             }
         })
@@ -106,22 +90,12 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
         .flat_map(|idx| {
             let start = idx * (2 * max_los);
             let end = start + max_los;
-
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "[start, end) is always in bounds of rotation because (start-end) < 2 * max_los, start < rotation.len() - (2*max_los)",
-            )]
             &rotation[start..end]
         })
         .map(|&val| {
-            #[expect(clippy::as_conversions, clippy::cast_possible_wrap, clippy::cast_possible_truncation, reason="We only support 32 bit platforms")]
             let x = (val / width as i32) - max_los as i32;
-            #[expect(clippy::as_conversions, clippy::cast_possible_wrap, clippy::cast_possible_truncation, reason="We only support 32 bit platforms")]
             let y = (val % width as i32) - max_los as i32;
-
-            #[expect(clippy::as_conversions, clippy::cast_possible_truncation, reason="(max_los^2) < (2 << 31)")]
-            #[expect(clippy::cast_possible_wrap, reason="We only support 32 bit platforms")]
-            if (0i32..max_los as i32).contains(&x) && (0i32..max_los as i32).contains(&y) {
+            if (0..max_los as i32).contains(&x) && (0..max_los as i32).contains(&y) {
                 x * (max_los as i32) + y
             } else {
                 -1i32
@@ -213,7 +187,7 @@ fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result
                 reason = "[pov+1, pov+max_los) is always in bounds"
             )]
             let elevations = line[pov + 1..pov + max_los]
-                .into_iter()
+                .iter()
                 .map(|&x| f32::from(x) - pov_height);
 
             // Here be dragons:
@@ -235,7 +209,7 @@ fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result
             let mut max_angle: f32 = -2000.0;
 
             // add up the visible surfaces for the heatmap
-            let surface_bitmap = zip(&distances, &angles)
+            let _surface_bitmap = zip(&distances, &angles)
                 .map(|(&(distance, _), &angle)| {
                     // a particular point is visible if all previous points before it
                     // are at a lower angle
