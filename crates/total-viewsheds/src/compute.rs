@@ -125,11 +125,9 @@ const EARTH_RADIUS_SQUARED: f32 = 12_742_000.0;
 /// see the TVS paper for reasoning.
 const TAN_ONE_RAD: f32 = 0.017_453_3;
 
-/// `total_viewshed` calculates a straight-lined total viewshed, which makes it ripe for
-/// instruction level parallelism (ILP) and vectorization (via SIMD)
+/// `total_viewshed` calculates a straight-lined total viewshed using AVX2 instructions
 #[target_feature(enable = "avx2")]
-#[expect(clippy::transmute_ptr_to_ptr, reason = "")]
-fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result: &mut [f32]) {
+fn total_viewshed_vector(elevation_map: &[i16], indexes: &[i32], max_los: usize, result: &mut [f32]) {
     assert_eq!(
         elevation_map.len(),
         2 * max_los * max_los,
@@ -222,7 +220,7 @@ fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result
 
             // carry out a SIMD prefix max using AVX instructions a la https://en.algorithmica.org/hpc/algorithms/prefix/
             // This method is a bit inefficient from an algorithmic perspective, as we are doing n*log(n) amount of work,
-            // but in the end, the ability to make use of AVX makes up for this, and halves the speed on benchmarks.
+            // but in the end, the ability to make use of AVX makes up for this, and doubles the speed on benchmarks.
             //
             // First we compute a prefix max for blocks of 4 f32s, but 8 at a time
             // (like `prefix` in algorithmica's algorithm).
@@ -360,6 +358,12 @@ fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result
     }
 }
 
+fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result: &mut [f32]) {
+    if cfg!(target_feature = "avx2") {
+        unsafe { total_viewshed_vector(elevation_map, indexes, max_los, result) }
+    }
+}
+
 /// `kernel` is a CPU-based total viewshed kernel. It makes use of image rotation to
 /// optimize the cache locality of all lookups for a total viewshed calculation
 fn kernel(elevations: &[i16], max_los_points: usize, angle: usize, res: &mut [f32]) {
@@ -381,10 +385,7 @@ fn kernel(elevations: &[i16], max_los_points: usize, angle: usize, res: &mut [f3
 
     start = Instant::now();
 
-    // safety: because I say so!
-    unsafe {
-        total_viewshed(&rotated_elevations, &indexes, max_los_points, res);
-    };
+    total_viewshed(&rotated_elevations, &indexes, max_los_points, res);
     tracing::info!("kernel for {} run in: {:?}", angle, start.elapsed());
 }
 
