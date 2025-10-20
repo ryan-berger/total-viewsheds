@@ -301,9 +301,9 @@ fn total_viewshed_vector(elevation_map: &[i16], indexes: &[i32], max_los: usize,
                 };
 
                 v_prefix_max = {
-                    let shifted = _mm256_slli_si256::<8>(_mm256_castps_si256(angle));
+                    let shifted = _mm256_slli_si256::<8>(_mm256_castps_si256(v_prefix_max));
                     let blended =
-                        _mm256_blend_ps::<0b110_01100>(_mm256_castsi256_ps(shifted), max_angles);
+                        _mm256_blend_ps::<0b1100_1100>(_mm256_castsi256_ps(shifted), max_angles);
                     _mm256_max_ps(v_prefix_max, blended)
                 };
 
