@@ -1,8 +1,13 @@
 //! The main entrypoint for running computations.
 
 use color_eyre::{eyre::Ok, Result};
-use itertools::izip;
+use std::arch::x86_64::{
+    __m128, __m256, _mm256_blend_ps, _mm256_castps_si256, _mm256_castsi256_ps, _mm256_max_ps,
+    _mm256_set1_ps, _mm256_slli_si256, _mm_broadcast_ss, _mm_max_ps, _mm_set1_ps,
+};
 use std::iter::zip;
+use std::mem::transmute;
+use std::simd::prelude::*;
 use std::thread;
 use std::time::Instant;
 
@@ -36,6 +41,12 @@ pub struct Compute<'compute> {
 
 /// `generate_rotation` generates a rotation "map" for a given elevation list
 /// Adapted from [this stack overflow answer](https://stackoverflow.com/a/71901621)
+#[expect(
+    clippy::as_conversions,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    reason = "asdfasdf"
+)]
 fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Vec<i16>) {
     let width = (max_los * 3) as isize;
 
@@ -62,7 +73,7 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
             let normalized = if new_idx >= 0 && new_idx < elevs.len() as isize {
                 new_idx
             } else {
-                panic!("bad idx: {new_idx}")
+                unreachable!()
             };
 
             rotation.push(normalized as i32);
@@ -81,6 +92,7 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
             if idx < 0i32 {
                 i16::MIN
             } else {
+                // safety: idx is clamped so a get will always be in-bounds
                 *unsafe { elevs.get_unchecked(idx as usize) }
             }
         })
@@ -95,7 +107,7 @@ fn generate_rotation(elevs: &[i16], angle: f64, max_los: usize) -> (Vec<i32>, Ve
         .map(|&val| {
             let x = (val / width as i32) - max_los as i32;
             let y = (val % width as i32) - max_los as i32;
-            if (0..max_los as i32).contains(&x) && (0..max_los as i32).contains(&y) {
+            if (0i32..max_los as i32).contains(&x) && (0i32..max_los as i32).contains(&y) {
                 x * (max_los as i32) + y
             } else {
                 -1i32
@@ -115,6 +127,8 @@ const TAN_ONE_RAD: f32 = 0.017_453_3;
 
 /// `total_viewshed` calculates a straight-lined total viewshed, which makes it ripe for
 /// instruction level parallelism (ILP) and vectorization (via SIMD)
+#[target_feature(enable = "avx2")]
+#[expect(clippy::transmute_ptr_to_ptr, reason = "")]
 fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result: &mut [f32]) {
     assert_eq!(
         elevation_map.len(),
@@ -122,8 +136,6 @@ fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result
         "elevations should be 2 * max_los wide, and max_los tall"
     );
 
-    // TODO: assertions like these make quite a bit of sense because it helps the vectorizer
-    //       figure out what is reasonable
     assert_eq!(
         max_los % 8,
         0,
@@ -134,7 +146,7 @@ fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result
 
     // precalculate all distances and their spherical earth "adjustments".
     // This saves ~33% of effort inside our hot loop
-    let distances = (1..max_los)
+    let distances = (0..max_los)
         .map(|x| {
             #[expect(
                 clippy::as_conversions,
@@ -146,7 +158,13 @@ fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result
         })
         .collect::<Vec<(f32, f32)>>();
 
-    let mut angles = vec![0.0f32; max_los - 1];
+    // allocate angles and their prefix maxes as mm256s so that the underlying buffer
+    // is correctly aligned to 256 bits
+    let mut angles: Vec<__m256> = vec![_mm256_set1_ps(0.0); max_los / 8];
+    let mut prefix_max: Vec<__m256> = vec![_mm256_set1_ps(0.0); max_los / 8];
+
+    // constant lowest value spatted across all 8 lanes
+    let max_angles = _mm256_set1_ps(-2000.0f32);
 
     for line_idx in 0..max_los {
         let elevation_offset = line_idx * width;
@@ -186,42 +204,147 @@ fn total_viewshed(elevation_map: &[i16], indexes: &[i32], max_los: usize, result
                 clippy::indexing_slicing,
                 reason = "[pov+1, pov+max_los) is always in bounds"
             )]
-            let elevations = line[pov + 1..pov + max_los]
+            let elevations = line[pov..pov + max_los]
                 .iter()
                 .map(|&x| f32::from(x) - pov_height);
 
-            // Here be dragons:
-            // Collect all angle calculations into a vec, turning all the lazy computations
-            // into an eager one. It looks inefficient, as it using memory to store intermediate results
-            // but the rest of the program depends on previous iterations which will block up the
-            // instruction pipeline and reduce FLOPS without the memory use.
-            //
-            // If you would like to optimize computation as a single unit, change the for_each to a
-            // map, and the surface_bitmap's zip iterator will contain all the code for a single loop.
-            // Good luck!
-            izip!(angles.iter_mut(), &distances, elevations).for_each(
-                |(angle, (distance, adjustment), elevation)| {
+            // safety: sizeof(__m256) ==  sizeof(f32) * 8, meaning it is well-aligned
+            let flat_angles = unsafe { transmute::<&mut [__m256], &mut [f32]>(angles.as_mut()) };
+
+            zip(flat_angles.iter_mut(), &distances)
+                .zip(elevations)
+                .for_each(|((angle, (distance, adjustment)), elevation)| {
                     *angle = (elevation / distance) - adjustment;
+                });
+
+            // get rid of NaN in the first angle calculation since there is a division by zero
+            flat_angles[0] = -2001.0;
+
+            // carry out a SIMD prefix max using AVX instructions a la https://en.algorithmica.org/hpc/algorithms/prefix/
+            // This method is a bit inefficient from an algorithmic perspective, as we are doing n*log(n) amount of work,
+            // but in the end, the ability to make use of AVX makes up for this, and halves the speed on benchmarks.
+            //
+            // First we compute a prefix max for blocks of 4 f32s, but 8 at a time
+            // (like `prefix` in algorithmica's algorithm).
+            // Each AVX vector register has 8 lanes, but are in groups of 4:
+            // angle_vec = | a_1 | a_2 | a_3 | a_4 | b_1 | b_2 | b_3 | b_4 |
+            //
+            // Operations such as max_ps operate on 128bit chunks, but two at a time.
+            //
+            // To do start we shift the lanes left by 4 bytes in an intermediary register leaving zeros:
+            // | 0 | a_1 | a_2 | a_3 | 0 | b_1 | b_2 | b_3 |
+            //
+            // Having zero shifted in is helpful if you are doing a prefix sum since 0 added to anything is itself,
+            // an identity element. However, zero is not a good identity element for `fmax`. Instead, we use
+            // -2000.0, which is lower than any angle calculation that we'll ever do making sure that
+            // ident(x) = fmax(x, -2000.0) = x.
+            //
+            // We blend in a constant vector full of -2000.0s, via blend_ps, passing in a mask
+            // of 0b1000_1000 which makes sure to only blend the first elements:
+            // shifted_vec = | -2000.0 | a_1 | a_2 | a_3 | -2000.0 | b_1 | b_2 | b_3 |
+            //
+            // And finally:
+            // v_prefix_max = max_ps(angle_vec, shifted_vec)
+            // = max (|   a_1   | a_2 | a_3 | a_4 |   b_1   | b_2 | b_3 | b_4 |,
+            //        | -2000.0 | a_1 | a_2 | a_3 | -2000.0 | b_2 | b_3 | b_4 |)
+            // =      |   a_1   | max(a_1, a_2) | max(a_2, a_3) | ...
+            //
+            // Visually, it should be clear that we have only computed the prefix max for the
+            // first two out of four elements. We can repeat this trick a second time but this time
+            // shifting our prefix max twice (and blending with a mask of 1100_1100),
+            // fully computing the prefix sum for both blocks of 4 elements.
+            // For brevity, only the first 4 lanes are pictured:
+            //
+            // v_prefix_max = |   a_1   | max(a_1, a_2) | max(a_2, a_3) | max(a_3, a_4) |
+            // shifted_vec =  | -2000.0 |    -2000.0    | a_1           | max(a_1, a_2) |
+            //
+            // v_prefix_max = max_ps(v_prefix_max, shifted_vec)
+            // = | a_1 | max(a_1, a_2) | max(a_1, max(a_2, a_3)) | max(max(a_1, a_2), max(a_3, a_4))
+            //
+            // MAGICAL
+            //
+            // However, now we have blocks of 4 prefix maxes calculated, not a prefix max calculated
+            // for the full array. To do so, we need to make a second pass to accumulate the
+            // results across blocks. Doing this is fairly simple. Take the last element of
+            // each block and "splat" it across all lanes:
+            //
+            // highest_from_block = | cur_block[3] | cur_block[3] | cur_block[3] | cur_block[3] |
+            //
+            // Our global max is 4 lanes of the max of all previous maxes of all other blocks
+            // In other words, it is an accumulated max:
+            //
+            // global_max = | x | x | x | x |
+            //
+            // Our new current block needs to be updated with the computation from the global_max,
+            // so just re-compute the current block by taking the max of it and global_max,:
+            //
+            // cur_block = max_ps(cur_block, global_max)
+            //
+            // and our new global_max is a scalar spatted across all lanes of the cumulative
+            // maximum of all other blocks:
+            //
+            // global_max = max_px(highest_from_block, global_max)
+            //
+            // And there you have it!
+            //
+            // To check to see if a point is visible, we can check whether the point is greater
+            // than or equal to the current prefix max:
+            //
+            // visibile(index) = angle[index] >= prefix_max[index]
+
+            // Calculate the 4-wide block prefix max two at a time
+            for (prefix, &angle) in zip(&mut prefix_max, &angles) {
+                let mut v_prefix_max: __m256 = {
+                    let shifted = _mm256_slli_si256::<4>(_mm256_castps_si256(angle));
+                    let blended =
+                        _mm256_blend_ps::<0b1000_1000>(_mm256_castsi256_ps(shifted), max_angles);
+
+                    _mm256_max_ps(angle, blended)
+                };
+
+                v_prefix_max = {
+                    let shifted = _mm256_slli_si256::<8>(_mm256_castps_si256(angle));
+                    let blended =
+                        _mm256_blend_ps::<0b110_01100>(_mm256_castsi256_ps(shifted), max_angles);
+                    _mm256_max_ps(v_prefix_max, blended)
+                };
+
+                *prefix = v_prefix_max;
+            }
+
+            // safety: sizeof(__m256) ==  sizeof(__m128) * 2, meaning it is well-aligned
+            let single_wide_angles =
+                unsafe { transmute::<&mut [__m256], &mut [__m128]>(prefix_max.as_mut()) };
+
+            let mut acc = _mm_set1_ps(-2000.0f32);
+
+            // accumulate the prefix maxes for blocks, re-computing all prefix maxes
+            // to include the accumulated value
+            for prefix in single_wide_angles {
+                let cur_prefix = Simd::from(*prefix);
+                let cur_max = _mm_broadcast_ss(&cur_prefix[3]);
+
+                *prefix = _mm_max_ps(acc, *prefix);
+                acc = _mm_max_ps(acc, cur_max);
+            }
+
+            // safety: sizeof(__m256) ==  sizeof(f32) * 8, meaning it is well-aligned
+            let flat_prefixes = unsafe { transmute::<&[__m256], &[f32]>(&prefix_max) };
+
+            let _surface = zip(flat_angles, flat_prefixes)
+                .map(|(&mut angle, &prefix)| angle >= prefix)
+                .collect::<Vec<bool>>();
+
+            let sum = zip(&distances, &_surface).fold(
+                0.0f32,
+                |surface_area, (&(distance, _), &visible)| {
+                    if visible {
+                        distance.mul_add(TAN_ONE_RAD, surface_area)
+                    } else {
+                        surface_area
+                    }
                 },
             );
-
-            let mut sum: f32 = 0.0;
-            let mut max_angle: f32 = -2000.0;
-
-            // add up the visible surfaces for the heatmap
-            let _surface_bitmap = zip(&distances, &angles)
-                .map(|(&(distance, _), &angle)| {
-                    // a particular point is visible if all previous points before it
-                    // are at a lower angle
-                    let higher = angle >= max_angle;
-                    if higher {
-                        sum += distance * TAN_ONE_RAD;
-                        max_angle = angle;
-                    }
-                    // keep track of whether a point is visible for further storage
-                    higher
-                })
-                .collect::<Vec<bool>>();
 
             // safety: it is guaranteed by the rotation kernel that if the index is
             // greater than zero that it is in-bounds. This saves ~10% of bounds checks
@@ -258,7 +381,10 @@ fn kernel(elevations: &[i16], max_los_points: usize, angle: usize, res: &mut [f3
 
     start = Instant::now();
 
-    total_viewshed(&rotated_elevations, &indexes, max_los_points, res);
+    // safety: because I say so!
+    unsafe {
+        total_viewshed(&rotated_elevations, &indexes, max_los_points, res);
+    };
     tracing::info!("kernel for {} run in: {:?}", angle, start.elapsed());
 }
 
@@ -348,10 +474,6 @@ impl<'compute> Compute<'compute> {
             ..Default::default()
         };
 
-        #[expect(
-            clippy::if_then_some_else_none,
-            reason = "The `?` is hard to use in the closure"
-        )]
         let vulkan = if matches!(backend, crate::config::Backend::Vulkan) {
             let elevations = dem.elevations.clone();
             dem.elevations = Vec::new(); // Free up some RAM.
@@ -478,7 +600,7 @@ impl<'compute> Compute<'compute> {
             let surfaces = multithreaded_kernel(
                 &elevations,
                 self.dem.max_los_as_points as usize,
-                90,
+                360,
                 NUM_CORES,
             );
 
